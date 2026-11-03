@@ -1,0 +1,8 @@
+node_modules/
+remotion/public/video/
+remotion/public/audio/
+remotion/out/
+remotion/props.json
+__pycache__/
+.DS_Store
+package-lock.json

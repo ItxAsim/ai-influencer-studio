@@ -1,0 +1,21 @@
+{
+  "name": "influencer-studio-finish",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Finishing pass for AI Influencer Studio: subtitles, hook title, ambient bed, camera drift.",
+  "scripts": {
+    "audio": "node tools/make-audio.mjs",
+    "studio": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts Talking out/final.mp4 --props=props.json --codec=h264 --crf=18"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.486",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.486"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "typescript": "5.5.4"
+  }
+}
