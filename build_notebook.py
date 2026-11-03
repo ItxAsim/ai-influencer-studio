@@ -61,14 +61,14 @@ md("## Setup")
 files = {str(p.relative_to(ROOT)): p.read_text() for p in EMBED}
 code(
     "# The studio's code, embedded so this notebook needs nothing else. Unpacked to /tmp/studio.\n"
-    f"FILES = {json.dumps(files, indent=0)}\n"
+    f"FILES = {json.dumps(files, indent=0, ensure_ascii=False)}\n"
     + r'''
 import os, sys
 from pathlib import Path
 for rel, text in FILES.items():
     p = Path("/tmp/studio") / rel
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text)
+    p.write_text(text, encoding="utf-8")
 sys.path.insert(0, "/tmp/studio/studio")
 print("unpacked", len(FILES), "files")
 '''
@@ -104,5 +104,13 @@ nb = {
     "nbformat": 4,
     "nbformat_minor": 4,
 }
-(ROOT / "influencer_studio.ipynb").write_text(json.dumps(nb, indent=1) + "\n")
+# Self-check: the embedded files must come back byte-identical when the cell runs (a literal that escapes
+# emoji as surrogate pairs, for example, can't be written to disk on Kaggle).
+_ns = {}
+exec(f"FILES = {json.dumps(files, ensure_ascii=False)}", _ns)
+for _rel, _text in _ns["FILES"].items():
+    _text.encode("utf-8")
+    assert _text == files[_rel], f"{_rel} does not round-trip"
+
+(ROOT / "influencer_studio.ipynb").write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
 print(f"wrote influencer_studio.ipynb ({len(cells)} cells, {len(EMBED)} embedded files)")
