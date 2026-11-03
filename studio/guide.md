@@ -48,11 +48,12 @@ One paragraph describing how they sound:
 Work through the tabs from left to right:
 1. **Character:** fill it in, upload the start frame, save.
 2. **Script:** get ideas, write the script, then **Use this script**.
-3. **Voice:** design the voice once, then speak the script.
-4. **Video:** make the clips.
-5. **Lip-sync & finish:** sync the mouth, then add the title, subtitles and sound.
+3. **Voice:** design the voice once (pick a take, **Use this voice**).
+4. **Video:** it uses the script you saved in step 2. Click **🎬 Make the full video from this script**: it
+   speaks the script, makes the clips, syncs the mouth and adds the title, subtitles and sound, all in one go.
+5. **Lip-sync & finish:** only if you want to redo a step yourself, e.g. drop a bad take and re-sync.
 
-After the first video, **Autopilot** on the Script tab runs steps 3 to 5 in one go.
+After the first video, **Autopilot** on the Script tab does the same straight from a new script.
 **Export character pack** saves the voice, so the character sounds the same in every video.
 
 ### Rules worth keeping

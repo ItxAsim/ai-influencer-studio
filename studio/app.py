@@ -184,16 +184,20 @@ def build():
         with gr.Tab("4 · Video"):
             gr.Markdown("Each seed is one ~5 s take of the character facing the camera (about 20 min each on a T4). "
                         "Lip-sync adds the speaking later, so the mouth stays relaxed here.")
+            video_info = gr.Markdown("⚠ No script yet: write one on the **Script** tab and click **Use this script**.")
             prompt = gr.Textbox(label="Prompt", lines=5)
             negative = gr.Textbox(label="Negative prompt", lines=3, value=P.DEFAULT_NEGATIVE)
             with gr.Row():
                 seeds = gr.Textbox(label="Seeds (one take each)", value="42, 7, 1234")
                 steps = gr.Slider(20, 50, value=40, step=5, label="Steps (fewer = faster, softer)")
-                takes_btn = gr.Button("Make takes", variant="primary")
+                takes_btn = gr.Button("Make takes only")
+            full_btn = gr.Button("🎬 Make the full video from this script  (voice → takes → lip-sync → finish)",
+                                 variant="primary", size="lg")
             takes_status = gr.HTML()
             takes_log = gr.Textbox(label="Log", lines=8, autoscroll=True)
             with gr.Row():
                 take_videos = [gr.Video(label=f"Take {i + 1}", height=360, visible=False) for i in range(MAX_TAKES)]
+            full_out = gr.Video(label="Final video", height=640)
 
         # ---------------------------------------------------------------- lip-sync & finish
         with gr.Tab("5 · Lip-sync & finish"):
@@ -263,17 +267,26 @@ def build():
                 raise gr.Error("Pick an idea first (or paste your own script).")
             return P.write_script(fields_of(*vals), idea, int(secs))
 
+        def script_info(vd):
+            if not vd or not (Path(vd) / "script.txt").exists():
+                return "⚠ No script yet: write one on the **Script** tab and click **Use this script**."
+            text = (Path(vd) / "script.txt").read_text().strip()
+            first = text.split("\n")[0][:110] + ("…" if len(text) > 110 else "")
+            voice = Path(vd) / "voice.wav"
+            spoken = f" · voice-over ready ({P.duration(voice):.0f} s)" if voice.exists() else " · not spoken yet (done automatically)"
+            return f"🎙 **Using the script saved in step 2:** “{first}” ({len(text.split())} words){spoken}"
+
         @guarded
         def on_use(script_, hook_, *vals):
             f = fields_of(*vals)
             if not script_.strip():
                 raise gr.Error("The script is empty.")
             d = P.new_video(f["name"], script_, hook_)
-            return d, f"Script saved for **{f['name']}**. Next: the **Voice** tab.", hook_
+            return d, f"Script saved for **{f['name']}**. Next: the **Voice** tab.", hook_, script_info(d)
 
         ideas_btn.click(on_ideas, [theme, *boxes.values()], [idea_pick])
         write_btn.click(on_write, [idea_pick, seconds, *boxes.values()], [script, hook])
-        use_btn.click(on_use, [script, hook, *boxes.values()], [video_dir, script_status, fin_hook])
+        use_btn.click(on_use, [script, hook, *boxes.values()], [video_dir, script_status, fin_hook, video_info])
 
         @guarded
         def on_design(name, desc, lang, n):
@@ -301,7 +314,8 @@ def build():
         design_btn.click(with_status("Designing the voice", on_design), [boxes["name"], voice_desc, language, n_takes], [*[voice_log, *take_audio, take_pick], voice_status])
         lock_btn.click(on_lock, [boxes["name"], take_pick, voice_desc, language], [current_voice])
         n_outputs[on_speak] = len([voice_log, voice_out])
-        speak_btn.click(with_status("Speaking the script", on_speak), [boxes["name"], video_dir], [*[voice_log, voice_out], voice_status])
+        speak_btn.click(with_status("Speaking the script", on_speak), [boxes["name"], video_dir], [*[voice_log, voice_out], voice_status]
+                        ).then(script_info, [video_dir], [video_info])
 
         def parse_seeds(text):
             try:
@@ -347,27 +361,53 @@ def build():
         n_outputs[on_finish] = len([fin_log, final, final_file])
         fin_btn.click(with_status("Finishing the video", on_finish), [video_dir, fin_hook, ambient, engine], [*[fin_log, final, final_file], fin_status])
 
+        def full_run(f, vd, prompt_, negative_, seeds_, steps_, hook_, amb):
+            """Voice (if not spoken yet) -> takes -> lip-sync -> finish for the saved script in `vd`.
+            Yields (log, take paths, final video or None)."""
+            if not P.saved_voice(f["name"])[0]:
+                raise gr.Error("Design the voice first (Voice tab → Design voice → Use this voice).")
+            if not (P.char_dir(f["name"]) / "start.png").exists():
+                raise gr.Error("Upload a start frame on the Character tab and save first.")
+            seeds_list = parse_seeds(seeds_)
+            takes_dir = Path(vd) / "takes"
+            takes = lambda: sorted(str(p) for p in takes_dir.glob("take_seed*.mp4"))
+            spoken = (Path(vd) / "voice.wav").exists() and (Path(vd) / "lines.json").exists()
+            stages = [] if spoken else [("1/4 VOICE", lambda: P.speak(f["name"], vd))]
+            stages += [
+                ("2/4 TAKES", lambda: P.make_takes(f["name"], vd, prompt_ or P.video_prompt(f), negative_, seeds_list, int(steps_))),
+                ("3/4 LIP-SYNC", lambda: P.lipsync(vd, takes(), 0)),
+                ("4/4 FINISH", lambda: P.finish(vd, hook_, float(amb))),
+            ]
+            history = ["Voice-over already made, reusing it."] if spoken else []
+            for title, make in stages:
+                log = ""
+                for log, result in make():
+                    final_ = result if title.endswith("FINISH") else None
+                    yield "\n".join(history + [f"== {title} ==", log]), takes(), final_
+                history += [f"== {title} ==", log.splitlines()[-1] if log else ""]
+
+        @guarded
+        def on_full(vd, prompt_, negative_, seeds_, steps_, hook_, amb, *vals):
+            if not vd:
+                raise gr.Error("Save a script first (Script tab → Use this script).")
+            for log, paths, final_ in full_run(fields_of(*vals), vd, prompt_, negative_, seeds_, steps_, hook_, amb):
+                vids, choices = take_updates(paths)
+                yield log, *vids, choices, final_ or gr.update()
+
+        n_outputs[on_full] = len([takes_log, *take_videos, use_takes, full_out])
+        full_btn.click(with_status("Making the full video", on_full),
+                       [video_dir, prompt, negative, seeds, steps, fin_hook, ambient, *boxes.values()],
+                       [*[takes_log, *take_videos, use_takes, full_out], takes_status]
+                       ).then(script_info, [video_dir], [video_info])
+
         @guarded
         def on_auto(script_, hook_, prompt_, negative_, seeds_, steps_, amb, *vals):
             f = fields_of(*vals)
-            if not P.saved_voice(f["name"])[0]:
-                raise gr.Error("Autopilot needs a saved voice: design one on the Voice tab first.")
             if not script_.strip():
                 raise gr.Error("The script is empty.")
             vd = P.new_video(f["name"], script_, hook_)
-            history = []
-            for title, gen in (
-                ("VOICE", P.speak(f["name"], vd)),
-                ("VIDEO", P.make_takes(f["name"], vd, prompt_ or P.video_prompt(f), negative_, parse_seeds(seeds_), int(steps_))),
-            ):
-                for log, _ in gen:
-                    yield "\n".join(history + [f"== {title} ==", log]), None, vd
-                history += [f"== {title} ==", log.splitlines()[-1] if log else ""]
-            takes = sorted(str(p) for p in (Path(vd) / "takes").glob("take_seed*.mp4"))
-            for title, gen in (("LIP-SYNC", P.lipsync(vd, takes, 0)), ("FINISH", P.finish(vd, hook_, float(amb)))):
-                for log, path in gen:
-                    yield "\n".join(history + [f"== {title} ==", log]), path if title == "FINISH" else None, vd
-                history += [f"== {title} ==", log.splitlines()[-1] if log else ""]
+            for log, _, final_ in full_run(f, vd, prompt_, negative_, seeds_, steps_, hook_, amb):
+                yield log, final_, vd
 
         n_outputs[on_auto] = 3
         auto_btn.click(with_status("Autopilot", on_auto), [script, hook, prompt, negative, seeds, steps, ambient, *boxes.values()],
