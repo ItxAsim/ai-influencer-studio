@@ -7,6 +7,7 @@
 import html
 import inspect
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -62,38 +63,63 @@ def status_html(state, title, detail="", seconds=0):
             f'<span class="detail">{html.escape(detail)}</span>{clock}</div>')
 
 
-def with_status(title, fn):
-    """Wrap a guarded step whose first output is its log: adds a live status bar as the last output."""
-    def run(*args):
-        t0, failed, out = time.time(), False, None
-        yield (*[gr.update()] * n_outputs[fn], status_html("busy", title, "starting...", 0.1))
-        for out in fn(*args):
-            log = out[0] or ""
-            failed = "❌ FAILED" in log
-            last = next((l for l in reversed(log.splitlines()) if l.strip()), "")
-            state = "fail" if failed else "busy"
-            yield (*out, status_html(state, title + (" failed" if failed else "..."), last, time.time() - t0))
-        if out is not None and not failed:
-            yield (*out, status_html("done", title + " done", "", time.time() - t0))
-    return run
+class Job:
+    """One step running in a background thread on the server.
 
+    It belongs to the server, not to a browser connection: closing the tab, losing the network or the share
+    link dropping does not stop it. The page polls the job (see `tick` in build) and shows its latest output,
+    so reopening the link picks the progress straight back up.
+    """
 
-n_outputs = {}
+    def __init__(self, kind, slot, title, detail, gen, log_first, heavy, on_end=None):
+        self.kind, self.slot, self.title, self.detail, self.on_end = kind, slot, title, detail, on_end
+        self.log_first, self.heavy = log_first, heavy
+        self.out, self.version, self.state, self.error = None, 0, "busy", ""
+        self.t0, self.t1 = time.time(), None
+        threading.Thread(target=self._run, args=(gen,), daemon=True).start()
 
-
-def with_spinner(title, detail, fn, n):
-    """For a step that returns all at once: show a busy bar while it runs, then done / failed."""
-    def run(*args):
-        t0 = time.time()
-        yield (*[gr.update()] * n, status_html("busy", title + "...", detail, 0.1))
+    def _run(self, gen):
         try:
-            out = fn(*args)
+            for out in gen:
+                self.out = out if isinstance(out, tuple) else (out,)
+                if self.log_first and "❌ FAILED" in (self.out[0] or ""):
+                    self.state = "fail"
+                self.version += 1
+            if self.state == "busy":
+                self.state = "done"
         except gr.Error as e:
-            yield (*[gr.update()] * n, status_html("fail", title + " failed", e.message, time.time() - t0))
-            raise
-        out = out if isinstance(out, tuple) else (out,)
-        yield (*out, status_html("done", title + " done", "", time.time() - t0))
-    return run
+            self.error, self.state = e.message, "fail"
+        except Exception as e:  # noqa: BLE001
+            self.error, self.state = f"{type(e).__name__}: {e}", "fail"
+        finally:
+            self.t1 = time.time()
+            self.version += 1
+            if self.on_end:
+                self.on_end()
+
+    def status(self):
+        seconds = (self.t1 or time.time()) - self.t0
+        if self.state == "busy":
+            log = (self.out[0] or "") if self.log_first and self.out else ""
+            last = next((l for l in reversed(log.splitlines()) if l.strip()), "") or self.detail
+            return status_html("busy", self.title + "...", last, max(seconds, 0.1))
+        if self.state == "fail":
+            return status_html("fail", self.title + " failed", self.error or "see the log below", seconds)
+        return status_html("done", self.title + " done", "", seconds)
+
+
+JOBS = {}  # slot -> its latest Job (one per area of the page)
+SESSION_FILE = P.HOME / "session.json"
+
+
+def session(**changes):
+    """The current character and video, kept on disk so a reopened page (or a new browser) can restore them."""
+    data = json.loads(SESSION_FILE.read_text()) if SESSION_FILE.exists() else {}
+    if changes:
+        data.update(changes)
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(json.dumps(data))
+    return data
 
 
 def guarded(fn):
@@ -115,7 +141,6 @@ def guarded(fn):
                 if last is None:
                     raise gr.Error(message(e)) from e
                 log = (last[0] or "") + f"\n\n❌ FAILED: {message(e)}"
-                gr.Warning("This step failed; the log shows why.")
                 yield (log, *[gr.update() for _ in last[1:]])
     else:
         def run(*args):
@@ -134,6 +159,10 @@ def build():
         gr.Markdown("# AI Influencer Studio\nCharacter → idea → script → voice → video → lip-sync → finished vertical video. "
                     "Free GPU, open models, no API keys. New here? Start with the **Guide** tab.")
 
+        with gr.Row(visible=False) as resume_row:
+            resume_note = gr.Markdown()
+            resume_btn = gr.Button("▶ Resume", variant="primary", scale=0)
+
         # ---------------------------------------------------------------- guide
         with gr.Tab("Guide"):
             gr.Markdown(GUIDE)
@@ -151,6 +180,8 @@ def build():
                     start = gr.Image(label="Start frame (waist-up, face big, 9:16)", type="filepath", height=520)
                     save_btn = gr.Button("Save character", variant="primary")
                     char_status = gr.Markdown()
+                    full_backup = gr.Checkbox(label="Full backup: include video takes and finished videos (bigger file). "
+                                                    "Import it in a new Kaggle session to carry on where you stopped.")
                     export_btn = gr.Button("Export character pack")
                     pack_out = gr.File(label="Character pack")
 
@@ -251,6 +282,7 @@ def build():
         def on_save(start_img, *vals):
             f = fields_of(*vals)
             d = P.save_character(f, start_img)
+            session(character=d.name)
             has_start = (d / "start.png").exists()
             msg = f"Saved **{f['name']}**." + ("" if has_start else " ⚠ Upload a start frame before making video.")
             return msg, gr.update(choices=P.list_characters(), value=d.name), P.video_prompt(f), *voice_state(f["name"])
@@ -260,6 +292,7 @@ def build():
             if not char_slug:
                 raise gr.Error("Pick a saved character.")
             f, start_img = P.load_character(char_slug)
+            session(character=char_slug)
             return (*[f.get(k, "") for k in FIELDS], start_img, P.video_prompt(f), *voice_state(f["name"]))
 
         @guarded
@@ -268,10 +301,6 @@ def build():
                 return gr.update()
             return gr.update(choices=P.list_characters(), value=P.import_pack(zip_file))
 
-        save_btn.click(on_save, [start, *boxes.values()], [char_status, saved, prompt, current_voice, voice_desc, language])
-        load_btn.click(on_load, [saved], [*boxes.values(), start, prompt, current_voice, voice_desc, language])
-        pack_in.upload(on_import, [pack_in], [saved])
-        export_btn.click(guarded(P.export_pack), [boxes["name"]], [pack_out])
 
         @guarded
         def on_ideas(theme_, *vals):
@@ -328,6 +357,7 @@ def build():
             if not script_.strip():
                 raise gr.Error("The script is empty.")
             d = P.new_video(f["name"], script_, hook_)
+            session(character=P.slug(f["name"]), video_dir=d)
             have = P.existing_takes(f["name"], prompt_ or P.video_prompt(f), negative_, steps_, parse_seeds(seeds_))
             if have:  # takes don't depend on the script: reuse the character's existing ones
                 (Path(d) / "takes.json").write_text(json.dumps(have))
@@ -336,12 +366,6 @@ def build():
             return (d, f"Script saved for **{f['name']}**.{note} Next: the **Voice** tab.", hook_, script_info(d),
                     *vids, choices, lipsync_info(d))
 
-        ideas_btn.click(with_spinner("Thinking up ideas", "the first time this downloads the 8 GB script-writer model, about 1–3 min", on_ideas, 1),
-                        [theme, *boxes.values()], [idea_pick, script_busy])
-        write_btn.click(with_spinner("Writing the script", "the first time this downloads the 8 GB script-writer model, about 1–3 min", on_write, 2),
-                        [idea_pick, seconds, *boxes.values()], [script, hook, script_busy])
-        use_btn.click(on_use, [script, hook, prompt, negative, seeds, steps, *boxes.values()],
-                      [video_dir, script_status, fin_hook, video_info, *take_videos, use_takes, ls_info])
 
         @guarded
         def on_design(name, desc, lang, n):
@@ -365,12 +389,6 @@ def build():
             for log, path in P.speak(name, vd):
                 yield log, path
 
-        n_outputs[on_design] = len([voice_log, *take_audio, take_pick])
-        design_btn.click(with_status("Designing the voice", on_design), [boxes["name"], voice_desc, language, n_takes], [*[voice_log, *take_audio, take_pick], voice_status])
-        lock_btn.click(on_lock, [boxes["name"], take_pick, voice_desc, language], [current_voice])
-        n_outputs[on_speak] = len([voice_log, voice_out])
-        speak_btn.click(with_status("Speaking the script", on_speak), [boxes["name"], video_dir], [*[voice_log, voice_out], voice_status]
-                        ).then(script_info, [video_dir], [video_info]).then(lipsync_info, [video_dir], [ls_info])
 
         @guarded
         def on_takes(name, vd, prompt_, negative_, seeds_, steps_):
@@ -380,10 +398,6 @@ def build():
                 vids, choices = take_updates(paths)
                 yield log, *vids, choices
 
-        n_outputs[on_takes] = len([takes_log, *take_videos, use_takes])
-        takes_btn.click(with_status("Making the video takes", on_takes), [boxes["name"], video_dir, prompt, negative, seeds, steps], [*[takes_log, *take_videos, use_takes], takes_status]
-                        ).then(lipsync_info, [video_dir], [ls_info])
-        use_takes.change(lipsync_info, [video_dir, use_takes], [ls_info])
 
         @guarded
         def on_lipsync(vd, takes, keep_, fp16_):
@@ -404,10 +418,6 @@ def build():
             for log, path in P.finish(vd, hook_, float(amb), eng):
                 yield log, path, path
 
-        n_outputs[on_lipsync] = len([ls_log, ls_out])
-        ls_btn.click(with_status("Lip-syncing", on_lipsync), [video_dir, use_takes, keep, fp16], [*[ls_log, ls_out], ls_status])
-        n_outputs[on_finish] = len([fin_log, final, final_file])
-        fin_btn.click(with_status("Finishing the video", on_finish), [video_dir, fin_hook, ambient, engine], [*[fin_log, final, final_file], fin_status])
 
         def full_run(f, vd, prompt_, negative_, seeds_, steps_, hook_, amb):
             """Voice (if not spoken yet) -> takes -> lip-sync -> finish for the saved script in `vd`.
@@ -420,11 +430,13 @@ def build():
             takes = lambda: saved_takes(vd)
             spoken = (Path(vd) / "voice.wav").exists() and (Path(vd) / "lines.json").exists()
             stages = [] if spoken else [("1/4 VOICE", lambda: P.speak(f["name"], vd))]
-            stages += [
-                ("2/4 TAKES", lambda: P.make_takes(f["name"], vd, prompt_ or P.video_prompt(f), negative_, seeds_list, int(steps_))),
-                ("3/4 LIP-SYNC", lambda: P.lipsync(vd, takes(), 0)),
-                ("4/4 FINISH", lambda: P.finish(vd, hook_, float(amb))),
-            ]
+            stages += [("2/4 TAKES", lambda: P.make_takes(f["name"], vd, prompt_ or P.video_prompt(f), negative_,
+                                                          seeds_list, int(steps_)))]
+            ls, inputs = Path(vd) / "lipsync.mp4", [Path(vd) / "voice.wav", Path(vd) / "takes.json"]
+            synced = ls.exists() and all(i.exists() and ls.stat().st_mtime > i.stat().st_mtime for i in inputs)
+            if not synced:  # resuming after a restart: a finished lip-sync for the same voice and takes is kept
+                stages += [("3/4 LIP-SYNC", lambda: P.lipsync(vd, takes(), 0))]
+            stages += [("4/4 FINISH", lambda: P.finish(vd, hook_, float(amb)))]
             history = ["Voice-over already made, reusing it."] if spoken else []
             for title, make in stages:
                 log = ""
@@ -442,11 +454,6 @@ def build():
                 vids, choices = take_updates(paths)
                 yield log, *vids, choices, final_ or gr.update()
 
-        n_outputs[on_full] = len([takes_log, *take_videos, use_takes, full_out])
-        full_btn.click(with_status("Making the full video", on_full),
-                       [video_dir, prompt, negative, seeds, steps, fin_hook, ambient, *boxes.values()],
-                       [*[takes_log, *take_videos, use_takes, full_out], takes_status]
-                       ).then(script_info, [video_dir], [video_info]).then(lipsync_info, [video_dir], [ls_info])
 
         @guarded
         def on_auto(script_, hook_, prompt_, negative_, seeds_, steps_, amb, *vals):
@@ -454,12 +461,154 @@ def build():
             if not script_.strip():
                 raise gr.Error("The script is empty.")
             vd = P.new_video(f["name"], script_, hook_)
+            session(character=P.slug(f["name"]), video_dir=vd)
             for log, _, final_ in full_run(f, vd, prompt_, negative_, seeds_, steps_, hook_, amb):
                 yield log, final_, vd
 
-        n_outputs[on_auto] = 3
-        auto_btn.click(with_status("Autopilot", on_auto), [script, hook, prompt, negative, seeds, steps, ambient, *boxes.values()],
-                       [auto_log, auto_out, video_dir, auto_status])
+        # ================================================================ background jobs
+        # slot = one area of the page with one status bar; it shows the latest job started there.
+        SLOTS = {
+            "script": (script_busy, [idea_pick, script, hook]),
+            "voice": (voice_status, [voice_log, *take_audio, take_pick, voice_out, video_info, ls_info]),
+            "video": (takes_status, [takes_log, *take_videos, use_takes, full_out, video_info, ls_info]),
+            "lipsync": (ls_status, [ls_log, ls_out, ls_info]),
+            "finish": (fin_status, [fin_log, final, final_file]),
+            "auto": (auto_status, [auto_log, auto_out, video_dir, video_info, ls_info]),
+        }
+        # kind: (slot, title, detail while it has no log yet, handler, what the handler returns, log first?, GPU?)
+        KINDS = {
+            "ideas": ("script", "Thinking up ideas", "the first time this downloads the 8 GB script-writer model, about 1–3 min", on_ideas, [idea_pick], False, False),
+            "write": ("script", "Writing the script", "the first time this downloads the 8 GB script-writer model, about 1–3 min", on_write, [script, hook], False, False),
+            "design": ("voice", "Designing the voice", "", on_design, [voice_log, *take_audio, take_pick], True, True),
+            "speak": ("voice", "Speaking the script", "", on_speak, [voice_log, voice_out], True, True),
+            "takes": ("video", "Making the video takes", "", on_takes, [takes_log, *take_videos, use_takes], True, True),
+            "full": ("video", "Making the full video", "", on_full, [takes_log, *take_videos, use_takes, full_out], True, True),
+            "lipsync": ("lipsync", "Lip-syncing", "", on_lipsync, [ls_log, ls_out], True, True),
+            "finish": ("finish", "Finishing the video", "", on_finish, [fin_log, final, final_file], True, False),
+            "auto": ("auto", "Autopilot", "", on_auto, [auto_log, auto_out, video_dir], True, True),
+        }
+
+        def starter(kind):
+            slot, title, detail, fn, _, log_first, heavy = KINDS[kind]
+
+            def click(*args):
+                running = [j for j in JOBS.values() if j.state == "busy" and (j.slot == slot or (heavy and j.heavy))]
+                if running:
+                    raise gr.Error(f"“{running[0].title}” is still running (it keeps going even if you close the "
+                                   "page). Wait for it to finish, then try again.")
+                if inspect.isgeneratorfunction(fn):
+                    gen = fn(*args)
+                else:
+                    def gen_once():
+                        yield fn(*args)
+                    gen = gen_once()
+                if heavy:  # remembered on disk: if the app or notebook restarts mid-run, it can be resumed
+                    session(pending={"kind": kind, "title": title, "args": list(args)})
+                job = JOBS[slot] = Job(kind, slot, title, detail, gen, log_first, heavy,
+                                       on_end=(lambda: session(pending=None)) if heavy else None)
+                for _ in range(10):  # a quick validation error ("save a script first") is shown straight away
+                    if job.state != "busy":
+                        break
+                    time.sleep(0.1)
+                if job.state == "fail":
+                    raise gr.Error(job.error or "This step failed; see the log.")
+                return job.status()
+            return click
+
+        def ticker(slot):
+            status, comps = SLOTS[slot]
+
+            def tick(seen):
+                job = JOBS.get(slot)
+                same = [gr.update()] * len(comps)
+                if job is None:
+                    return seen, *same, gr.update()
+                if job.version == seen:  # nothing new: only the status bar's clock moves
+                    return seen, *same, (job.status() if job.state == "busy" else gr.update())
+                given = {id(c): v for c, v in zip(KINDS[job.kind][4], job.out or ())}
+                vd = session().get("video_dir", "")
+                values = []
+                for c in comps:
+                    if id(c) in given:
+                        values.append(given[id(c)])
+                    elif c is video_info:
+                        values.append(script_info(vd))
+                    elif c is ls_info:
+                        values.append(lipsync_info(vd))
+                    else:
+                        values.append(gr.update())
+                return job.version, *values, job.status()
+            return tick
+
+        timer = gr.Timer(2.0)
+        for slot, (status, comps) in SLOTS.items():
+            seen = gr.State(-1)
+            timer.tick(ticker(slot), [seen], [seen, *comps, status], show_progress="hidden", queue=False)
+
+        def go(kind, button, inputs):
+            button.click(starter(kind), inputs, [SLOTS[KINDS[kind][0]][0]])
+
+        go("ideas", ideas_btn, [theme, *boxes.values()])
+        go("write", write_btn, [idea_pick, seconds, *boxes.values()])
+        go("design", design_btn, [boxes["name"], voice_desc, language, n_takes])
+        go("speak", speak_btn, [boxes["name"], video_dir])
+        go("takes", takes_btn, [boxes["name"], video_dir, prompt, negative, seeds, steps])
+        go("full", full_btn, [video_dir, prompt, negative, seeds, steps, fin_hook, ambient, *boxes.values()])
+        go("lipsync", ls_btn, [video_dir, use_takes, keep, fp16])
+        go("finish", fin_btn, [video_dir, fin_hook, ambient, engine])
+        go("auto", auto_btn, [script, hook, prompt, negative, seeds, steps, ambient, *boxes.values()])
+
+        # quick steps stay ordinary requests
+        save_btn.click(on_save, [start, *boxes.values()], [char_status, saved, prompt, current_voice, voice_desc, language])
+        load_btn.click(on_load, [saved], [*boxes.values(), start, prompt, current_voice, voice_desc, language])
+        pack_in.upload(on_import, [pack_in], [saved])
+        export_btn.click(guarded(P.export_pack), [boxes["name"], full_backup], [pack_out])
+        use_btn.click(on_use, [script, hook, prompt, negative, seeds, steps, *boxes.values()],
+                      [video_dir, script_status, fin_hook, video_info, *take_videos, use_takes, ls_info])
+        lock_btn.click(on_lock, [boxes["name"], take_pick, voice_desc, language], [current_voice])
+        use_takes.change(lipsync_info, [video_dir, use_takes], [ls_info])
+
+        # ================================================================ reopening the page
+        def restore():
+            """Put back the current character, script and results, so a reload or a new browser carries on."""
+            data = session()
+            char, vd = data.get("character"), data.get("video_dir", "")
+            if not char or not (P.HOME / char / "character.json").exists():
+                return [gr.update()] * len(restore_out)
+            f, start_img = P.load_character(char)
+            out = [gr.update(choices=P.list_characters(), value=char), *[f.get(k, "") for k in FIELDS], start_img,
+                   P.video_prompt(f), *voice_state(f["name"])]
+            v = Path(vd) if vd and Path(vd).exists() else None
+            read = lambda name: (v / name).read_text() if v and (v / name).exists() else ""
+            path = lambda name: str(v / name) if v and (v / name).exists() else None
+            vids, choices = take_updates(saved_takes(vd) if v else [])
+            out += [vd if v else "", read("script.txt"), read("hook.txt"), read("hook.txt"),
+                    script_info(vd if v else ""), lipsync_info(vd if v else ""), *vids, choices,
+                    path("voice.wav"), path("lipsync.mp4"), path("final.mp4"), path("final.mp4")]
+            return out
+
+        def resume_offer():
+            pending = session().get("pending")
+            if not pending or any(j.state == "busy" for j in JOBS.values()):
+                return gr.update(visible=False), ""
+            return (gr.update(visible=True),
+                    f"⏸ **“{pending['title']}” was interrupted** (the app or notebook restarted). "
+                    "Resume carries on from where it stopped: finished takes, voice-overs and lip-syncs are reused.")
+
+        def on_resume():
+            pending = session().get("pending")
+            if not pending:
+                return gr.update(visible=False)
+            starter(pending["kind"])(*pending["args"])
+            return gr.update(visible=False)
+
+        resume_btn.click(on_resume, None, [resume_row])
+        demo.load(resume_offer, None, [resume_row, resume_note])
+
+        restore_out = [saved, *boxes.values(), start, prompt, current_voice, voice_desc, language,
+                       video_dir, script, hook, fin_hook, video_info, ls_info, *take_videos, use_takes,
+                       voice_out, ls_out, final, final_file]
+        demo.load(restore, None, restore_out)
     return demo
 
 

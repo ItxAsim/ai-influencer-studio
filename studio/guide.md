@@ -56,6 +56,17 @@ Work through the tabs from left to right:
 After the first video, **Autopilot** on the Script tab does the same straight from a new script.
 **Export character pack** saves the voice, so the character sounds the same in every video.
 
+### If the connection drops, or Kaggle restarts
+- **Closing the tab or losing the connection doesn't stop anything.** Steps run on the Kaggle machine, not in
+  your browser. Reopen the link and the page reconnects to the running step and restores your character,
+  script and results.
+- **If the app or notebook restarts** (but the Kaggle session is still on), run the notebook again: a
+  **▶ Resume** button appears at the top. Finished takes, voice-overs and lip-syncs are reused, so it carries on
+  from where it stopped.
+- **When the Kaggle session ends,** Kaggle deletes its files. Before that happens, tick **Full backup** and click
+  **Export character pack** on the Character tab, then download the zip. In a new session, import it in the same
+  place, and your character, voice, takes and videos are all back.
+
 ### Rules worth keeping
 - **Say it's AI.** TikTok, Instagram and YouTube all require realistic AI-generated content to be labelled,
   so use their AI-content toggle. Never present the character as a real person or copy a real person's face.

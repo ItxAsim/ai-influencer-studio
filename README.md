@@ -34,9 +34,12 @@ talking video:
 5. Work through the tabs: **Guide → Character → Script → Voice → Video → Lip-sync & finish**.
    After the first video, **Autopilot** (Script tab) runs voice → video → lip-sync → finish in one click.
 
-Keep the Kaggle tab open while you work; the app runs inside the notebook session. Everything is saved under
-`/kaggle/working/studio`. **Export character pack** saves the character and its voice; import it in a new
-session so the character always sounds the same.
+Steps run as background jobs on the Kaggle machine, so closing the browser or losing the connection doesn't
+stop them; reopen the link to pick the progress back up. If the notebook restarts mid-run, a **▶ Resume**
+button carries on from where it stopped (finished takes, voice-overs and lip-syncs are reused).
+Everything is saved under `/kaggle/working/studio` while the session lasts. **Export character pack** saves the
+character and its voice; tick **Full backup** to include all takes and videos, and import it in a new session
+to carry on.
 
 A 35–50 s video takes about 1.5–2 hours on a T4 the first time, mostly video generation (~20 min per take)
 and lip-sync. Kaggle gives about 30 GPU hours a week.

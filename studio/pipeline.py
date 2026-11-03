@@ -121,29 +121,37 @@ def load_character(char_slug):
 
 
 def import_pack(zip_path):
-    """Unpack a character_pack.zip (from export_pack) into the studio; returns the character's slug."""
+    """Unpack a character pack / backup (from export_pack) into the studio; returns the character's slug.
+    A full backup also brings back the character's video takes and videos, so work carries over to a new session."""
     tmp = HOME / "_import"
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.unpack_archive(zip_path, tmp)
     found = next(tmp.rglob("character.json"))
     name = json.loads(found.read_text())["name"]
     dest = char_dir(name)
-    for f in found.parent.iterdir():
-        if f.is_file():
-            shutil.copy(f, dest)
+    shutil.copytree(found.parent, dest, dirs_exist_ok=True)
     shutil.rmtree(tmp)
     return dest.name
 
 
-def export_pack(name):
+def export_pack(name, include_media=False):
+    """The character pack: profile, start frame and voice. With include_media, also every take and video
+    (a full backup: much bigger, but a new Kaggle session can carry on exactly where this one stopped)."""
     d = char_dir(name)
-    files = [f for f in ("character.json", "start.png", "voice_ref.wav", "voice_meta.json") if (d / f).exists()]
     stage = HOME / "_export" / d.name
     shutil.rmtree(HOME / "_export", ignore_errors=True)
     stage.mkdir(parents=True)
-    for f in files:
-        shutil.copy(d / f, stage)
-    return shutil.make_archive(str(d / f"{d.name}_character_pack"), "zip", HOME / "_export", d.name)
+    for f in ("character.json", "start.png", "voice_ref.wav", "voice_meta.json"):
+        if (d / f).exists():
+            shutil.copy(d / f, stage)
+    if include_media:
+        for sub in ("takes", "videos"):
+            if (d / sub).exists():
+                shutil.copytree(d / sub, stage / sub, ignore=shutil.ignore_patterns("*.pt", "lipsync_input.mp4"))
+    kind = "backup" if include_media else "character_pack"
+    out = shutil.make_archive(str(HOME / f"{d.name}_{kind}"), "zip", HOME / "_export", d.name)
+    shutil.rmtree(HOME / "_export", ignore_errors=True)
+    return out
 
 
 def video_prompt(fields):
