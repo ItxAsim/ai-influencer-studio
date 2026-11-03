@@ -4,6 +4,7 @@
   launch(share=True, password="...")   # from the notebook: a public link, protected by a password
 """
 
+import inspect
 import json
 from pathlib import Path
 
@@ -37,15 +38,27 @@ LANGUAGES = ["English", "Chinese", "Japanese", "Korean", "German", "French", "Ru
 MAX_TAKES = 4
 
 
-def guarded(gen):
-    """Turn exceptions inside a step into a visible error in the UI instead of a silent stop."""
-    def run(*args):
-        try:
-            yield from gen(*args)
-        except gr.Error:
-            raise
-        except Exception as e:  # noqa: BLE001
-            raise gr.Error(str(e)) from e
+def guarded(fn):
+    """Show a step's real error message in the UI (Gradio otherwise shows only "Error")."""
+    def message(e):
+        return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+    if inspect.isgeneratorfunction(fn):
+        def run(*args):
+            try:
+                yield from fn(*args)
+            except gr.Error:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise gr.Error(message(e)) from e
+    else:
+        def run(*args):
+            try:
+                return fn(*args)
+            except gr.Error:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise gr.Error(message(e)) from e
     return run
 
 
@@ -157,6 +170,7 @@ def build():
             ref, meta = P.saved_voice(name) if name.strip() else (None, None)
             return ref, (meta or {}).get("description", DEFAULT_VOICE), (meta or {}).get("language", "English")
 
+        @guarded
         def on_save(start_img, *vals):
             f = fields_of(*vals)
             d = P.save_character(f, start_img)
@@ -164,12 +178,14 @@ def build():
             msg = f"Saved **{f['name']}**." + ("" if has_start else " ⚠ Upload a start frame before making video.")
             return msg, gr.update(choices=P.list_characters(), value=d.name), P.video_prompt(f), *voice_state(f["name"])
 
+        @guarded
         def on_load(char_slug):
             if not char_slug:
                 raise gr.Error("Pick a saved character.")
             f, start_img = P.load_character(char_slug)
             return (*[f.get(k, "") for k in FIELDS], start_img, P.video_prompt(f), *voice_state(f["name"]))
 
+        @guarded
         def on_import(zip_file):
             if not zip_file:
                 return gr.update()
@@ -178,17 +194,20 @@ def build():
         save_btn.click(on_save, [start, *boxes.values()], [char_status, saved, prompt, current_voice, voice_desc, language])
         load_btn.click(on_load, [saved], [*boxes.values(), start, prompt, current_voice, voice_desc, language])
         pack_in.upload(on_import, [pack_in], [saved])
-        export_btn.click(lambda name: P.export_pack(name), [boxes["name"]], [pack_out])
+        export_btn.click(guarded(P.export_pack), [boxes["name"]], [pack_out])
 
+        @guarded
         def on_ideas(theme_, *vals):
             found = P.ideas(fields_of(*vals), theme_)
             return gr.update(choices=found, value=found[0] if found else None)
 
+        @guarded
         def on_write(idea, secs, *vals):
             if not idea:
                 raise gr.Error("Pick an idea first (or paste your own script).")
             return P.write_script(fields_of(*vals), idea, int(secs))
 
+        @guarded
         def on_use(script_, hook_, *vals):
             f = fields_of(*vals)
             if not script_.strip():
@@ -209,6 +228,7 @@ def build():
                                  value=paths[0] if paths else None)
                 yield log, *audios, pick
 
+        @guarded
         def on_lock(name, take, desc, lang):
             if not take:
                 raise gr.Error("Design the voice and pick a take first.")

@@ -14,7 +14,9 @@ class Writer:
     def __init__(self, character, model=MODEL):
         self.character = character
         self.tok = AutoTokenizer.from_pretrained(model)
-        self.model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.float16, device_map="cuda:0")
+        if not torch.cuda.is_available():
+            raise RuntimeError("The script writer needs a GPU: turn on GPU T4 x2 in Kaggle's session options.")
+        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=torch.float16, device_map="cuda:0")
 
     def _ask(self, prompt, max_new_tokens=900):
         system = (
@@ -23,10 +25,13 @@ class Writer:
             "CREATOR PROFILE:\n" + json.dumps(self.character, indent=2)
         )
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
-        ids = self.tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to("cuda:0")
+        # return_dict: transformers 5 returns a dict here by default (input_ids + attention_mask); ask for it explicitly
+        inputs = self.tok.apply_chat_template(
+            msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True
+        ).to("cuda:0")
         with torch.no_grad():
-            out = self.model.generate(ids, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.8, top_p=0.9)
-        return self.tok.decode(out[0, ids.shape[1] :], skip_special_tokens=True).strip()
+            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.8, top_p=0.9)
+        return self.tok.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True).strip()
 
     def ideas(self, n=8, theme=""):
         text = self._ask(
