@@ -190,10 +190,23 @@ def new_video(name, script, hook):
 # ------------------------------------------------------------------ voice
 
 def _ensure_tts(log):
-    if not (TTS_ENV / "bin" / "python").exists():
-        yield log.add("Installing the voice model environment (first time only, ~3 min)...")
-        for line in stream(f"uv venv -q -p 3.10 {TTS_ENV} && uv pip install -q -p {TTS_ENV} qwen-tts soundfile numpy"):
+    # The .ready marker is written only after a complete, verified install, so a half-finished install
+    # (interrupted, out of disk, network blip) is redone instead of silently reused.
+    if (TTS_ENV / ".ready").exists():
+        return
+    yield log.add("Installing the voice model environment (first time only, ~5 min)...")
+    shutil.rmtree(TTS_ENV, ignore_errors=True)
+    # torch from the CUDA 12.8 index: the newest PyPI build targets CUDA 13, which Kaggle's driver may not run.
+    for line in stream(
+        f"uv venv -q -p 3.10 {TTS_ENV} && "
+        f"uv pip install -p {TTS_ENV} --index-url https://download.pytorch.org/whl/cu128 torch torchaudio && "
+        f"uv pip install -p {TTS_ENV} qwen-tts soundfile numpy && "
+        f"{TTS_ENV}/bin/python -c 'import torch, qwen_tts, soundfile, numpy; "
+        "print(\"voice env OK, torch\", torch.__version__, \"cuda\", torch.cuda.is_available())'"
+    ):
+        if not line.startswith((" +", " -", "Resolved", "Prepared", "Installed", "Downloading", "Uninstalled")):
             yield log.add(line)
+    (TTS_ENV / ".ready").touch()
 
 
 def _tts(args):
@@ -278,7 +291,7 @@ def make_takes(name, video_dir, prompt, negative, seeds, steps):
 # ------------------------------------------------------------------ lip-sync
 
 def _ensure_latentsync(log):
-    if not (LATENTSYNC / ".venv").exists():
+    if not (LATENTSYNC / ".ready").exists():
         yield log.add("Installing LatentSync (first time only, ~5 min)...")
         for line in stream(
             f"rm -rf {LATENTSYNC} && git clone -q https://github.com/bytedance/LatentSync.git {LATENTSYNC} && "
@@ -288,6 +301,7 @@ def _ensure_latentsync(log):
             "--local-dir checkpoints"
         ):
             yield log.add(line)
+        (LATENTSYNC / ".ready").touch()
 
 
 def lipsync(video_dir, take_paths, keep_seconds, fp16=False, steps=20):
