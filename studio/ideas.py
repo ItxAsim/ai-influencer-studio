@@ -16,7 +16,10 @@ class Writer:
         self.tok = AutoTokenizer.from_pretrained(model)
         if not torch.cuda.is_available():
             raise RuntimeError("The script writer needs a GPU: turn on GPU T4 x2 in Kaggle's session options.")
-        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=torch.float16, device_map="cuda:0")
+        # On Kaggle's T4 x2 the writer lives on the second GPU, so it never competes with the video, voice and
+        # lip-sync steps, which all run on the first.
+        self.device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=torch.float16, device_map=self.device)
 
     def _ask(self, prompt, max_new_tokens=900):
         system = (
@@ -28,7 +31,7 @@ class Writer:
         # return_dict: transformers 5 returns a dict here by default (input_ids + attention_mask); ask for it explicitly
         inputs = self.tok.apply_chat_template(
             msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True
-        ).to("cuda:0")
+        ).to(self.device)
         with torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.8, top_p=0.9)
         return self.tok.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True).strip()
@@ -56,6 +59,7 @@ class Writer:
         return text, hook
 
     def close(self):
+        self.model.to("cpu")  # move off the GPU first, so the memory is returned even if a reference lingers
         del self.model
         gc.collect()
         torch.cuda.empty_cache()

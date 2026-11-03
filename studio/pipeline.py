@@ -51,7 +51,10 @@ def slug(name):
 def stream(cmd, cwd=None, env=None):
     """Run a shell command, yielding its output line by line; raises if it fails."""
     # unbuffered, so a child's prints reach the UI as they happen instead of in one burst at the end
-    p = subprocess.Popen(cmd, shell=True, cwd=cwd, env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
+    # GPU steps run on the first GPU; expandable segments lets PyTorch reuse fragmented memory on a 16 GB card
+    p = subprocess.Popen(cmd, shell=True, cwd=cwd, env={**os.environ, "PYTHONUNBUFFERED": "1",
+                         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "CUDA_VISIBLE_DEVICES": "0",
+                         **(env or {})},
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     tail = []
     for line in p.stdout:
@@ -169,9 +172,11 @@ def _get_writer(fields):
 
 
 def release_writer():
-    """Free the LLM's GPU memory before a GPU-heavy step."""
+    """Free the LLM's GPU memory before a GPU-heavy step (matters when there is only one GPU)."""
     global _writer
     if _writer is not None:
+        if _writer.device != "cuda:0":
+            return  # on its own GPU: keep it loaded, so the next ideas/script request is instant
         _writer.close()
         _writer = None
 
