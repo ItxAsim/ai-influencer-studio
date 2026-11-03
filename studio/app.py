@@ -44,13 +44,21 @@ def guarded(fn):
         return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
 
     if inspect.isgeneratorfunction(fn):
+        # Long steps yield (log, ...). On failure, keep the log on screen and add the error to it, so the
+        # user sees what went wrong instead of an "Error" badge over an empty box.
         def run(*args):
+            last = None
             try:
-                yield from fn(*args)
+                for last in fn(*args):
+                    yield last
             except gr.Error:
                 raise
             except Exception as e:  # noqa: BLE001
-                raise gr.Error(message(e)) from e
+                if last is None:
+                    raise gr.Error(message(e)) from e
+                log = (last[0] or "") + f"\n\n❌ FAILED: {message(e)}"
+                gr.Warning("This step failed; the log shows why.")
+                yield (log, *[gr.update() for _ in last[1:]])
     else:
         def run(*args):
             try:

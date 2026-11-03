@@ -51,12 +51,14 @@ def stream(cmd, cwd=None, env=None):
     """Run a shell command, yielding its output line by line; raises if it fails."""
     p = subprocess.Popen(cmd, shell=True, cwd=cwd, env={**os.environ, **(env or {})},
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail = []
     for line in p.stdout:
         line = line.rstrip()
         if line:
+            tail = (tail + [line])[-15:]
             yield line
     if p.wait():
-        raise RuntimeError(f"command failed ({p.returncode}): {cmd.split()[0]} ...")
+        raise RuntimeError(f"step failed (exit {p.returncode}). Last output:\n" + "\n".join(tail))
 
 
 class Log:
