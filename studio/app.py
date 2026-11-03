@@ -4,8 +4,10 @@
   launch(share=True, password="...")   # from the notebook: a public link, protected by a password
 """
 
+import html
 import inspect
 import json
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -36,6 +38,47 @@ DEFAULT_VOICE = (
 )
 LANGUAGES = ["English", "Chinese", "Japanese", "Korean", "German", "French", "Russian", "Portuguese", "Spanish", "Italian"]
 MAX_TAKES = 4
+
+
+CSS = """
+.status {display: flex; align-items: center; gap: 14px; padding: 14px 18px; border-radius: 12px;
+          font-size: 15px; line-height: 1.4; border: 1px solid var(--border-color-primary);
+          background: var(--background-fill-secondary);}
+.status b {white-space: nowrap;}
+.status .detail {opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;}
+.status .clock {font-variant-numeric: tabular-nums; opacity: .75;}
+.spinner {width: 20px; height: 20px; flex: none; border-radius: 50%; border: 3px solid rgba(128, 128, 128, .3);
+           border-top-color: var(--color-accent, #f97316); animation: spin .9s linear infinite;}
+@keyframes spin {to {transform: rotate(360deg);}}
+.status.done {border-color: #22c55e;} .status.fail {border-color: #ef4444;}
+"""
+
+
+def status_html(state, title, detail="", seconds=0):
+    """The bar above a step's output: a spinner while it runs, then a tick or a cross."""
+    icon = {"busy": '<div class="spinner"></div>', "done": "✅", "fail": "❌"}[state]
+    clock = f'<span class="clock">{int(seconds) // 60}:{int(seconds) % 60:02d}</span>' if seconds else ""
+    return (f'<div class="status {state}">{icon}<b>{html.escape(title)}</b>'
+            f'<span class="detail">{html.escape(detail)}</span>{clock}</div>')
+
+
+def with_status(title, fn):
+    """Wrap a guarded step whose first output is its log: adds a live status bar as the last output."""
+    def run(*args):
+        t0, failed, out = time.time(), False, None
+        yield (*[gr.update()] * n_outputs[fn], status_html("busy", title, "starting...", 0.1))
+        for out in fn(*args):
+            log = out[0] or ""
+            failed = "❌ FAILED" in log
+            last = next((l for l in reversed(log.splitlines()) if l.strip()), "")
+            state = "fail" if failed else "busy"
+            yield (*out, status_html(state, title + (" failed" if failed else "..."), last, time.time() - t0))
+        if out is not None and not failed:
+            yield (*out, status_html("done", title + " done", "", time.time() - t0))
+    return run
+
+
+n_outputs = {}
 
 
 def guarded(fn):
@@ -113,6 +156,7 @@ def build():
                 use_btn = gr.Button("Use this script", variant="primary")
                 auto_btn = gr.Button("Autopilot: voice → video → lip-sync → finish")
             script_status = gr.Markdown()
+            auto_status = gr.HTML()
             auto_log = gr.Textbox(label="Autopilot log", lines=10, autoscroll=True)
             auto_out = gr.Video(label="Final video", height=560)
 
@@ -126,6 +170,7 @@ def build():
                 language = gr.Dropdown(LANGUAGES, value="English", label="Language")
                 n_takes = gr.Slider(2, MAX_TAKES, value=4, step=1, label="Takes")
                 design_btn = gr.Button("Design voice")
+            voice_status = gr.HTML()
             take_audio = [gr.Audio(label=f"Take {i + 1}", type="filepath", interactive=False, visible=False)
                           for i in range(MAX_TAKES)]
             with gr.Row():
@@ -145,6 +190,7 @@ def build():
                 seeds = gr.Textbox(label="Seeds (one take each)", value="42, 7, 1234")
                 steps = gr.Slider(20, 50, value=40, step=5, label="Steps (fewer = faster, softer)")
                 takes_btn = gr.Button("Make takes", variant="primary")
+            takes_status = gr.HTML()
             takes_log = gr.Textbox(label="Log", lines=8, autoscroll=True)
             with gr.Row():
                 take_videos = [gr.Video(label=f"Take {i + 1}", height=360, visible=False) for i in range(MAX_TAKES)]
@@ -156,6 +202,7 @@ def build():
                 keep = gr.Number(value=0, minimum=0, maximum=5, step=0.5, label="Keep only the first N seconds of each take (0 = all)")
                 fp16 = gr.Checkbox(label="Faster lip-sync (fp16); turn off if the mouth looks noisy")
                 ls_btn = gr.Button("Lip-sync", variant="primary")
+            ls_status = gr.HTML()
             ls_log = gr.Textbox(label="Log", lines=8, autoscroll=True)
             ls_out = gr.Video(label="Lip-synced", height=480)
             with gr.Row():
@@ -163,6 +210,7 @@ def build():
                 ambient = gr.Slider(0, 0.5, value=0.18, step=0.02, label="Ambient sound")
                 engine = gr.Radio(["remotion", "ffmpeg"], value="remotion", label="Finish with")
                 fin_btn = gr.Button("Finish", variant="primary")
+            fin_status = gr.HTML()
             fin_log = gr.Textbox(label="Log", lines=6, autoscroll=True)
             final = gr.Video(label="Final video", height=640)
             final_file = gr.File(label="Download")
@@ -249,9 +297,11 @@ def build():
             for log, path in P.speak(name, vd):
                 yield log, path
 
-        design_btn.click(on_design, [boxes["name"], voice_desc, language, n_takes], [voice_log, *take_audio, take_pick])
+        n_outputs[on_design] = len([voice_log, *take_audio, take_pick])
+        design_btn.click(with_status("Designing the voice", on_design), [boxes["name"], voice_desc, language, n_takes], [*[voice_log, *take_audio, take_pick], voice_status])
         lock_btn.click(on_lock, [boxes["name"], take_pick, voice_desc, language], [current_voice])
-        speak_btn.click(on_speak, [boxes["name"], video_dir], [voice_log, voice_out])
+        n_outputs[on_speak] = len([voice_log, voice_out])
+        speak_btn.click(with_status("Speaking the script", on_speak), [boxes["name"], video_dir], [*[voice_log, voice_out], voice_status])
 
         def parse_seeds(text):
             try:
@@ -275,7 +325,8 @@ def build():
                 vids, choices = take_updates(paths)
                 yield log, *vids, choices
 
-        takes_btn.click(on_takes, [boxes["name"], video_dir, prompt, negative, seeds, steps], [takes_log, *take_videos, use_takes])
+        n_outputs[on_takes] = len([takes_log, *take_videos, use_takes])
+        takes_btn.click(with_status("Making the video takes", on_takes), [boxes["name"], video_dir, prompt, negative, seeds, steps], [*[takes_log, *take_videos, use_takes], takes_status])
 
         @guarded
         def on_lipsync(vd, takes, keep_, fp16_):
@@ -291,8 +342,10 @@ def build():
             for log, path in P.finish(vd, hook_, float(amb), eng):
                 yield log, path, path
 
-        ls_btn.click(on_lipsync, [video_dir, use_takes, keep, fp16], [ls_log, ls_out])
-        fin_btn.click(on_finish, [video_dir, fin_hook, ambient, engine], [fin_log, final, final_file])
+        n_outputs[on_lipsync] = len([ls_log, ls_out])
+        ls_btn.click(with_status("Lip-syncing", on_lipsync), [video_dir, use_takes, keep, fp16], [*[ls_log, ls_out], ls_status])
+        n_outputs[on_finish] = len([fin_log, final, final_file])
+        fin_btn.click(with_status("Finishing the video", on_finish), [video_dir, fin_hook, ambient, engine], [*[fin_log, final, final_file], fin_status])
 
         @guarded
         def on_auto(script_, hook_, prompt_, negative_, seeds_, steps_, amb, *vals):
@@ -316,8 +369,9 @@ def build():
                     yield "\n".join(history + [f"== {title} ==", log]), path if title == "FINISH" else None, vd
                 history += [f"== {title} ==", log.splitlines()[-1] if log else ""]
 
-        auto_btn.click(on_auto, [script, hook, prompt, negative, seeds, steps, ambient, *boxes.values()],
-                       [auto_log, auto_out, video_dir])
+        n_outputs[on_auto] = 3
+        auto_btn.click(with_status("Autopilot", on_auto), [script, hook, prompt, negative, seeds, steps, ambient, *boxes.values()],
+                       [auto_log, auto_out, video_dir, auto_status])
     return demo
 
 
@@ -325,12 +379,12 @@ def launch(share=True, password=None):
     demo = build()
     auth = ("studio", password) if password else None
     demo.queue(default_concurrency_limit=1).launch(
-        share=share, auth=auth, allowed_paths=[str(P.HOME.resolve()), "/tmp"], show_error=True, theme=gr.themes.Soft(),
+        share=share, auth=auth, allowed_paths=[str(P.HOME.resolve()), "/tmp"], show_error=True, theme=gr.themes.Soft(), css=CSS,
     )
     return demo
 
 
 if __name__ == "__main__":
     build().queue(default_concurrency_limit=1).launch(
-        allowed_paths=[str(P.HOME.resolve())], show_error=True, theme=gr.themes.Soft()
+        allowed_paths=[str(P.HOME.resolve())], show_error=True, theme=gr.themes.Soft(), css=CSS
     )

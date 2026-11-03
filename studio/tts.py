@@ -37,10 +37,11 @@ def design(args):
     model = load(DESIGN_MODEL, args.dtype)
     spec = Path(args.spec).read_text().strip()
     for i in range(1, args.takes + 1):
+        print(f"Making take {i} of {args.takes}...", flush=True)
         torch.manual_seed(100 + i)
         wavs, sr = model.generate_voice_design(text=args.line, language=args.lang, instruct=spec)
         sf.write(out / f"take_{i}.wav", np.asarray(wavs[0], dtype=np.float32), sr)
-        print(f"take_{i}.wav")
+        print(f"Take {i} of {args.takes} ready.", flush=True)
 
 
 def speak(args):
@@ -52,6 +53,7 @@ def speak(args):
     chunks, sentences, sr = [], [], None
     t = LEAD_IN
     for text, pause in split_script(Path(args.script).read_text()):
+        print(f"Speaking: {text}", flush=True)
         torch.manual_seed(7)
         wavs, sr = model.generate_voice_clone(text=text, language=args.lang, voice_clone_prompt=prompt)
         audio = np.asarray(wavs[0], dtype=np.float32)

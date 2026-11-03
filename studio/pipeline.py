@@ -49,7 +49,8 @@ def slug(name):
 
 def stream(cmd, cwd=None, env=None):
     """Run a shell command, yielding its output line by line; raises if it fails."""
-    p = subprocess.Popen(cmd, shell=True, cwd=cwd, env={**os.environ, **(env or {})},
+    # unbuffered, so a child's prints reach the UI as they happen instead of in one burst at the end
+    p = subprocess.Popen(cmd, shell=True, cwd=cwd, env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     tail = []
     for line in p.stdout:
@@ -68,7 +69,10 @@ class Log:
         self.lines = []
 
     def add(self, line):
-        self.lines.append(line)
+        if "%|" in line and self.lines and "%|" in self.lines[-1]:
+            self.lines[-1] = line  # a progress bar redrawing itself: keep only its latest state
+        else:
+            self.lines.append(line)
         self.lines = self.lines[-400:]
         return self.text
 
@@ -190,6 +194,8 @@ def new_video(name, script, hook):
 # ------------------------------------------------------------------ voice
 
 def _ensure_tts(log):
+    if not shutil.which("sox"):  # the voice library looks for SoX at start-up; install it to keep the log clean
+        subprocess.run("apt-get -qq install -y sox", shell=True, capture_output=True)
     # The .ready marker is written only after a complete, verified install, so a half-finished install
     # (interrupted, out of disk, network blip) is redone instead of silently reused.
     if (TTS_ENV / ".ready").exists():
@@ -234,7 +240,8 @@ def design_voice(name, description, language, takes, dtype="float32"):
     yield log.add(f"Designing {takes} voice takes..."), []
     line = TEST_LINE.replace('"', "'")
     for l in stream(_tts(f'--lang {language} --dtype {dtype} design --spec "{spec}" --line "{line}" --takes {takes} --out "{out}"')):
-        yield log.add(l), []
+        # hand over each take as soon as it exists, so it can be played while the rest are made
+        yield log.add(l), [str(out / f"take_{i}.wav") for i in range(1, takes + 1) if (out / f"take_{i}.wav").exists()]
     yield log.add("Listen and pick the one that sounds like your character."), [str(out / f"take_{i}.wav") for i in range(1, takes + 1)]
 
 
@@ -282,8 +289,6 @@ def make_takes(name, video_dir, prompt, negative, seeds, steps):
     cmd = (f'python {HERE}/wan.py --image "{char_dir(name)}/start.png" --prompt "{vd}/prompt.txt" '
            f'--negative "{vd}/negative.txt" --seeds {" ".join(map(str, seeds))} --steps {steps} --out "{takes}"')
     for l in stream(cmd):
-        if "%|" in l and not l.endswith("100%"):  # skip most progress-bar redraws
-            continue
         yield log.add(l), sorted(map(str, takes.glob("take_seed*.mp4")))
     yield log.add("Takes ready. Pick the ones to use."), sorted(map(str, takes.glob("take_seed*.mp4")))
 
@@ -326,8 +331,6 @@ def lipsync(video_dir, take_paths, keep_seconds, fp16=False, steps=20):
            f'--seed 1247 --enable_deepcache --video_path "{vd}/lipsync_input.mp4" --audio_path "{vd}/lipsync_voice.wav" '
            f'--video_out_path "{out}" --temp_dir /tmp/ls_temp')
     for l in stream(cmd, cwd=LATENTSYNC, env={"MPLBACKEND": "Agg"}):
-        if "%|" in l and not l.endswith("100%"):
-            continue
         yield log.add(l), None
     for f in ("lipsync_input.mp4", "lipsync_voice.wav"):
         (vd / f).unlink(missing_ok=True)
