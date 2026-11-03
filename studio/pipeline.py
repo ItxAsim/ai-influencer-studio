@@ -7,6 +7,7 @@ The GPU-heavy steps (voice, video, lip-sync) run as separate processes in their 
 are generators that yield their log so the UI can show progress.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -277,20 +278,42 @@ def speak(name, video_dir, dtype="float32"):
 
 # ------------------------------------------------------------------ video takes
 
+def takes_dir(name, prompt, negative, steps):
+    """Takes don't depend on the script, only on the start frame and the video settings, so they're kept per
+    character and reused by every video with the same settings (a new script then skips ~1 h of generation)."""
+    start = char_dir(name) / "start.png"
+    key = hashlib.sha1(
+        json.dumps([prompt.strip(), negative.strip(), int(steps)]).encode()
+        + (start.read_bytes() if start.exists() else b"")
+    ).hexdigest()[:10]
+    return char_dir(name) / "takes" / key
+
+
+def existing_takes(name, prompt, negative, steps, seeds):
+    d = takes_dir(name, prompt, negative, steps)
+    return [str(d / f"take_seed{s}.mp4") for s in seeds if (d / f"take_seed{s}.mp4").exists()]
+
+
 def make_takes(name, video_dir, prompt, negative, seeds, steps):
-    """Generator: yields (log, list of take paths)."""
+    """Generator: yields (log, list of take paths). Takes already made with these settings are reused."""
     release_writer()
     log = Log()
-    vd = Path(video_dir)
-    (vd / "prompt.txt").write_text(prompt.strip())
-    (vd / "negative.txt").write_text(negative.strip())
-    takes = vd / "takes"
-    yield log.add(f"Making {len(seeds)} takes (about 20 min each on a T4)..."), []
-    cmd = (f'python {HERE}/wan.py --image "{char_dir(name)}/start.png" --prompt "{vd}/prompt.txt" '
-           f'--negative "{vd}/negative.txt" --seeds {" ".join(map(str, seeds))} --steps {steps} --out "{takes}"')
-    for l in stream(cmd):
-        yield log.add(l), sorted(map(str, takes.glob("take_seed*.mp4")))
-    yield log.add("Takes ready. Pick the ones to use."), sorted(map(str, takes.glob("take_seed*.mp4")))
+    takes = takes_dir(name, prompt, negative, steps)
+    takes.mkdir(parents=True, exist_ok=True)
+    (takes / "prompt.txt").write_text(prompt.strip())
+    (takes / "negative.txt").write_text(negative.strip())
+    have = existing_takes(name, prompt, negative, steps, seeds)
+    todo = [s for s in seeds if str(takes / f"take_seed{s}.mp4") not in have]
+    if have:
+        yield log.add(f"Reusing {len(have)} take(s) already made with these settings."), have
+    if todo:
+        yield log.add(f"Making {len(todo)} take(s) (about 20 min each on a T4)..."), have
+        cmd = (f'python {HERE}/wan.py --image "{char_dir(name)}/start.png" --prompt "{takes}/prompt.txt" '
+               f'--negative "{takes}/negative.txt" --seeds {" ".join(map(str, todo))} --steps {steps} --out "{takes}"')
+        for l in stream(cmd):
+            yield log.add(l), existing_takes(name, prompt, negative, steps, seeds)
+    (Path(video_dir) / "takes.json").write_text(json.dumps(existing_takes(name, prompt, negative, steps, seeds)))
+    yield log.add("Takes ready. Pick the ones to use."), existing_takes(name, prompt, negative, steps, seeds)
 
 
 # ------------------------------------------------------------------ lip-sync

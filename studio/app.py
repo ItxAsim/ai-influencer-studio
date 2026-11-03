@@ -81,6 +81,21 @@ def with_status(title, fn):
 n_outputs = {}
 
 
+def with_spinner(title, detail, fn, n):
+    """For a step that returns all at once: show a busy bar while it runs, then done / failed."""
+    def run(*args):
+        t0 = time.time()
+        yield (*[gr.update()] * n, status_html("busy", title + "...", detail, 0.1))
+        try:
+            out = fn(*args)
+        except gr.Error as e:
+            yield (*[gr.update()] * n, status_html("fail", title + " failed", e.message, time.time() - t0))
+            raise
+        out = out if isinstance(out, tuple) else (out,)
+        yield (*out, status_html("done", title + " done", "", time.time() - t0))
+    return run
+
+
 def guarded(fn):
     """Show a step's real error message in the UI (Gradio otherwise shows only "Error")."""
     def message(e):
@@ -146,6 +161,7 @@ def build():
             with gr.Row():
                 theme = gr.Textbox(label="Theme (optional)", placeholder="e.g. sleep, common myths", scale=3)
                 ideas_btn = gr.Button("Suggest ideas", scale=1)
+            script_busy = gr.HTML()
             idea_pick = gr.Radio([], label="Ideas")
             with gr.Row():
                 seconds = gr.Slider(15, 60, value=35, step=5, label="Length (seconds)")
@@ -201,6 +217,7 @@ def build():
 
         # ---------------------------------------------------------------- lip-sync & finish
         with gr.Tab("5 · Lip-sync & finish"):
+            ls_info = gr.Markdown("⚠ No script yet: save one on the **Script** tab.")
             use_takes = gr.CheckboxGroup([], label="Takes to use (in this order); skip any where the face warps")
             with gr.Row():
                 keep = gr.Number(value=0, minimum=0, maximum=5, step=0.5, label="Keep only the first N seconds of each take (0 = all)")
@@ -276,17 +293,55 @@ def build():
             spoken = f" · voice-over ready ({P.duration(voice):.0f} s)" if voice.exists() else " · not spoken yet (done automatically)"
             return f"🎙 **Using the script saved in step 2:** “{first}” ({len(text.split())} words){spoken}"
 
+        def parse_seeds(text):
+            try:
+                s = [int(x) for x in text.replace(",", " ").split()]
+            except ValueError:
+                raise gr.Error("Seeds must be whole numbers, e.g. 42, 7, 1234.") from None
+            if not 1 <= len(s) <= MAX_TAKES:
+                raise gr.Error(f"Use 1 to {MAX_TAKES} seeds.")
+            return s
+
+        def take_updates(paths):
+            vids = [gr.update(value=paths[i] if i < len(paths) else None, visible=i < len(paths)) for i in range(MAX_TAKES)]
+            choices = [(Path(p).stem.replace("take_", ""), p) for p in paths]
+            return vids, gr.update(choices=choices, value=[p for _, p in choices])
+
+        def lipsync_info(vd, chosen=None):
+            if not vd:
+                return "⚠ No script yet: save one on the **Script** tab."
+            voice = Path(vd) / "voice.wav"
+            v = f"🎙 voice-over of the saved script ({P.duration(voice):.0f} s)" if voice.exists() else \
+                "🎙 voice-over: not made yet (Voice tab → **Speak the script**, or the 🎬 button)"
+            takes = chosen or saved_takes(vd)
+            t = ("🎞 takes: " + ", ".join(Path(p).stem.replace("take_seed", "seed ") for p in takes)) if takes else \
+                "🎞 takes: none yet (Video tab)"
+            return f"**Lip-sync uses:** {v} · {t}"
+
+        def saved_takes(vd):
+            f = Path(vd) / "takes.json"
+            return [p for p in json.loads(f.read_text()) if Path(p).exists()] if f.exists() else []
+
         @guarded
-        def on_use(script_, hook_, *vals):
+        def on_use(script_, hook_, prompt_, negative_, seeds_, steps_, *vals):
             f = fields_of(*vals)
             if not script_.strip():
                 raise gr.Error("The script is empty.")
             d = P.new_video(f["name"], script_, hook_)
-            return d, f"Script saved for **{f['name']}**. Next: the **Voice** tab.", hook_, script_info(d)
+            have = P.existing_takes(f["name"], prompt_ or P.video_prompt(f), negative_, steps_, parse_seeds(seeds_))
+            if have:  # takes don't depend on the script: reuse the character's existing ones
+                (Path(d) / "takes.json").write_text(json.dumps(have))
+            vids, choices = take_updates(have)
+            note = f" {len(have)} video take(s) from before will be reused." if have else ""
+            return (d, f"Script saved for **{f['name']}**.{note} Next: the **Voice** tab.", hook_, script_info(d),
+                    *vids, choices, lipsync_info(d))
 
-        ideas_btn.click(on_ideas, [theme, *boxes.values()], [idea_pick])
-        write_btn.click(on_write, [idea_pick, seconds, *boxes.values()], [script, hook])
-        use_btn.click(on_use, [script, hook, *boxes.values()], [video_dir, script_status, fin_hook, video_info])
+        ideas_btn.click(with_spinner("Thinking up ideas", "the first time this downloads the 8 GB script-writer model, about 1–3 min", on_ideas, 1),
+                        [theme, *boxes.values()], [idea_pick, script_busy])
+        write_btn.click(with_spinner("Writing the script", "the first time this downloads the 8 GB script-writer model, about 1–3 min", on_write, 2),
+                        [idea_pick, seconds, *boxes.values()], [script, hook, script_busy])
+        use_btn.click(on_use, [script, hook, prompt, negative, seeds, steps, *boxes.values()],
+                      [video_dir, script_status, fin_hook, video_info, *take_videos, use_takes, ls_info])
 
         @guarded
         def on_design(name, desc, lang, n):
@@ -315,21 +370,7 @@ def build():
         lock_btn.click(on_lock, [boxes["name"], take_pick, voice_desc, language], [current_voice])
         n_outputs[on_speak] = len([voice_log, voice_out])
         speak_btn.click(with_status("Speaking the script", on_speak), [boxes["name"], video_dir], [*[voice_log, voice_out], voice_status]
-                        ).then(script_info, [video_dir], [video_info])
-
-        def parse_seeds(text):
-            try:
-                s = [int(x) for x in text.replace(",", " ").split()]
-            except ValueError:
-                raise gr.Error("Seeds must be whole numbers, e.g. 42, 7, 1234.") from None
-            if not 1 <= len(s) <= MAX_TAKES:
-                raise gr.Error(f"Use 1 to {MAX_TAKES} seeds.")
-            return s
-
-        def take_updates(paths):
-            vids = [gr.update(value=paths[i] if i < len(paths) else None, visible=i < len(paths)) for i in range(MAX_TAKES)]
-            choices = [(Path(p).stem.replace("take_", ""), p) for p in paths]
-            return vids, gr.update(choices=choices, value=[p for _, p in choices])
+                        ).then(script_info, [video_dir], [video_info]).then(lipsync_info, [video_dir], [ls_info])
 
         @guarded
         def on_takes(name, vd, prompt_, negative_, seeds_, steps_):
@@ -340,12 +381,19 @@ def build():
                 yield log, *vids, choices
 
         n_outputs[on_takes] = len([takes_log, *take_videos, use_takes])
-        takes_btn.click(with_status("Making the video takes", on_takes), [boxes["name"], video_dir, prompt, negative, seeds, steps], [*[takes_log, *take_videos, use_takes], takes_status])
+        takes_btn.click(with_status("Making the video takes", on_takes), [boxes["name"], video_dir, prompt, negative, seeds, steps], [*[takes_log, *take_videos, use_takes], takes_status]
+                        ).then(lipsync_info, [video_dir], [ls_info])
+        use_takes.change(lipsync_info, [video_dir, use_takes], [ls_info])
 
         @guarded
         def on_lipsync(vd, takes, keep_, fp16_):
             if not vd:
                 raise gr.Error("Save a script first.")
+            takes = takes or saved_takes(vd)
+            if not takes:
+                raise gr.Error("No video takes yet: make them on the Video tab.")
+            if not (Path(vd) / "voice.wav").exists():
+                raise gr.Error("No voice-over yet: Voice tab → Speak the script.")
             for log, path in P.lipsync(vd, takes, float(keep_ or 0), fp16_):
                 yield log, path
 
@@ -369,8 +417,7 @@ def build():
             if not (P.char_dir(f["name"]) / "start.png").exists():
                 raise gr.Error("Upload a start frame on the Character tab and save first.")
             seeds_list = parse_seeds(seeds_)
-            takes_dir = Path(vd) / "takes"
-            takes = lambda: sorted(str(p) for p in takes_dir.glob("take_seed*.mp4"))
+            takes = lambda: saved_takes(vd)
             spoken = (Path(vd) / "voice.wav").exists() and (Path(vd) / "lines.json").exists()
             stages = [] if spoken else [("1/4 VOICE", lambda: P.speak(f["name"], vd))]
             stages += [
@@ -383,7 +430,8 @@ def build():
                 log = ""
                 for log, result in make():
                     final_ = result if title.endswith("FINISH") else None
-                    yield "\n".join(history + [f"== {title} ==", log]), takes(), final_
+                    shown = result if title.endswith("TAKES") else takes()
+                    yield "\n".join(history + [f"== {title} ==", log]), shown, final_
                 history += [f"== {title} ==", log.splitlines()[-1] if log else ""]
 
         @guarded
@@ -398,7 +446,7 @@ def build():
         full_btn.click(with_status("Making the full video", on_full),
                        [video_dir, prompt, negative, seeds, steps, fin_hook, ambient, *boxes.values()],
                        [*[takes_log, *take_videos, use_takes, full_out], takes_status]
-                       ).then(script_info, [video_dir], [video_info])
+                       ).then(script_info, [video_dir], [video_info]).then(lipsync_info, [video_dir], [ls_info])
 
         @guarded
         def on_auto(script_, hook_, prompt_, negative_, seeds_, steps_, amb, *vals):
