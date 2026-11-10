@@ -56,6 +56,11 @@ Work through the tabs from left to right:
 After the first video, **Autopilot** on the Script tab does the same straight from a new script.
 **Export character pack** saves the voice, so the character sounds the same in every video.
 
+### Made a mistake mid-run?
+Click **⏹ Stop the running step** (top of the page). Fix what was wrong (e.g. upload the right start frame and
+**Save character**), then start the step again. Finished parts are kept: the voice-over isn't remade, and a new
+start frame automatically gets new takes, so the wrong ones are never used.
+
 ### If the connection drops, or Kaggle restarts
 - **Closing the tab or losing the connection doesn't stop anything.** Steps run on the Kaggle machine, not in
   your browser. Reopen the link and the page reconnects to the running step and restores your character,

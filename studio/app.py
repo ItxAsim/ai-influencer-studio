@@ -51,13 +51,13 @@ CSS = """
 .spinner {width: 20px; height: 20px; flex: none; border-radius: 50%; border: 3px solid rgba(128, 128, 128, .3);
            border-top-color: var(--color-accent, #f97316); animation: spin .9s linear infinite;}
 @keyframes spin {to {transform: rotate(360deg);}}
-.status.done {border-color: #22c55e;} .status.fail {border-color: #ef4444;}
+.status.done {border-color: #22c55e;} .status.fail {border-color: #ef4444;} .status.stopped {border-color: #f59e0b;}
 """
 
 
 def status_html(state, title, detail="", seconds=0):
     """The bar above a step's output: a spinner while it runs, then a tick or a cross."""
-    icon = {"busy": '<div class="spinner"></div>', "done": "✅", "fail": "❌"}[state]
+    icon = {"busy": '<div class="spinner"></div>', "done": "✅", "fail": "❌", "stopped": "⏹"}[state]
     clock = f'<span class="clock">{int(seconds) // 60}:{int(seconds) % 60:02d}</span>' if seconds else ""
     return (f'<div class="status {state}">{icon}<b>{html.escape(title)}</b>'
             f'<span class="detail">{html.escape(detail)}</span>{clock}</div>')
@@ -87,6 +87,8 @@ class Job:
                 self.version += 1
             if self.state == "busy":
                 self.state = "done"
+        except P.Stopped as e:
+            self.error, self.state = str(e), "stopped"
         except gr.Error as e:
             self.error, self.state = e.message, "fail"
             self.quiet = not getattr(e, "print_exception", True)  # a "do X first" message, not a failure
@@ -104,6 +106,8 @@ class Job:
             log = (self.out[0] or "") if self.log_first and self.out else ""
             last = next((l for l in reversed(log.splitlines()) if l.strip()), "") or self.detail
             return status_html("busy", self.title + "...", last, max(seconds, 0.1))
+        if self.state == "stopped":
+            return status_html("stopped", self.title + " stopped", self.error, seconds)
         if self.state == "fail":
             return status_html("fail", self.title + " failed", self.error or "see the log below", seconds)
         return status_html("done", self.title + " done", "", seconds)
@@ -141,7 +145,7 @@ def guarded(fn):
             try:
                 for last in fn(*args):
                     yield last
-            except gr.Error:
+            except (gr.Error, P.Stopped):
                 raise
             except Exception as e:  # noqa: BLE001
                 if last is None:
@@ -165,6 +169,9 @@ def build():
         gr.Markdown("# AI Influencer Studio\nCharacter → idea → script → voice → video → lip-sync → finished vertical video. "
                     "Free GPU, open models, no API keys. New here? Start with the **Guide** tab.")
 
+        with gr.Row():
+            gr.Markdown("")
+            stop_btn = gr.Button("⏹ Stop the running step", variant="stop", size="sm", scale=0)
         with gr.Row(visible=False) as resume_row:
             resume_note = gr.Markdown()
             resume_btn = gr.Button("▶ Resume", variant="primary", scale=0)
@@ -615,6 +622,17 @@ def build():
             return gr.update(visible=False)
 
         resume_btn.click(on_resume, None, [resume_row])
+
+        def on_stop():
+            busy = [j for j in JOBS.values() if j.state == "busy"]
+            if not busy:
+                raise nope("Nothing is running.")
+            if not P.stop_all():
+                raise nope(f"“{busy[0].title}” can't be stopped mid-way (it isn't a GPU step); it ends on its own.")
+            session(pending=None)
+            gr.Info(f"Stopping “{busy[0].title}”. Change what you need, then start it again.")
+
+        stop_btn.click(on_stop, None, None)
         demo.load(resume_offer, None, [resume_row, resume_note])
 
         restore_out = [saved, *boxes.values(), start, prompt, current_voice, voice_desc, language,

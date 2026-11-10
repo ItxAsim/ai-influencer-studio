@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -48,22 +49,49 @@ def slug(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "character"
 
 
+_running = set()  # the GPU-step processes running now, so Stop can end them
+
+
+class Stopped(Exception):
+    """The user pressed Stop."""
+
+
+def stop_all():
+    """End every running step process, including its children (a step runs as `sh -c ... python ...`)."""
+    for p in list(_running):
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        p.stopped = True
+    return len(_running)
+
+
 def stream(cmd, cwd=None, env=None):
-    """Run a shell command, yielding its output line by line; raises if it fails."""
+    """Run a shell command, yielding its output line by line; raises if it fails or is stopped."""
     # unbuffered, so a child's prints reach the UI as they happen instead of in one burst at the end
     # GPU steps run on the first GPU; expandable segments lets PyTorch reuse fragmented memory on a 16 GB card
     p = subprocess.Popen(cmd, shell=True, cwd=cwd, env={**os.environ, "PYTHONUNBUFFERED": "1",
                          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "CUDA_VISIBLE_DEVICES": "0",
                          **(env or {})},
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                         start_new_session=True)  # own process group, so Stop ends the child too
+    p.stopped = False
+    _running.add(p)
     tail = []
-    for line in p.stdout:
-        line = line.rstrip()
-        if line:
-            tail = (tail + [line])[-15:]
-            yield line
-    if p.wait():
-        raise RuntimeError(f"step failed (exit {p.returncode}). Last output:\n" + "\n".join(tail))
+    try:
+        for line in p.stdout:
+            line = line.rstrip()
+            if line:
+                tail = (tail + [line])[-15:]
+                yield line
+        code = p.wait()
+    finally:
+        _running.discard(p)
+    if p.stopped:
+        raise Stopped("Stopped by you. Finished parts (voice-over, finished takes) are kept.")
+    if code:
+        raise RuntimeError(f"step failed (exit {code}). Last output:\n" + "\n".join(tail))
 
 
 class Log:
