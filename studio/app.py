@@ -74,7 +74,7 @@ class Job:
     def __init__(self, kind, slot, title, detail, gen, log_first, heavy, on_end=None):
         self.kind, self.slot, self.title, self.detail, self.on_end = kind, slot, title, detail, on_end
         self.log_first, self.heavy = log_first, heavy
-        self.out, self.version, self.state, self.error = None, 0, "busy", ""
+        self.out, self.version, self.state, self.error, self.quiet = None, 0, "busy", "", False
         self.t0, self.t1 = time.time(), None
         threading.Thread(target=self._run, args=(gen,), daemon=True).start()
 
@@ -89,6 +89,7 @@ class Job:
                 self.state = "done"
         except gr.Error as e:
             self.error, self.state = e.message, "fail"
+            self.quiet = not getattr(e, "print_exception", True)  # a "do X first" message, not a failure
         except Exception as e:  # noqa: BLE001
             self.error, self.state = f"{type(e).__name__}: {e}", "fail"
         finally:
@@ -122,6 +123,11 @@ def session(**changes):
     return data
 
 
+def nope(message):
+    """A 'please do X first' message: shown in the app, without a traceback in the notebook log."""
+    return gr.Error(message, title="Not yet", print_exception=False)
+
+
 def guarded(fn):
     """Show a step's real error message in the UI (Gradio otherwise shows only "Error")."""
     def message(e):
@@ -139,7 +145,7 @@ def guarded(fn):
                 raise
             except Exception as e:  # noqa: BLE001
                 if last is None:
-                    raise gr.Error(message(e)) from e
+                    raise gr.Error(message(e)) from e  # a real failure
                 log = (last[0] or "") + f"\n\n❌ FAILED: {message(e)}"
                 yield (log, *[gr.update() for _ in last[1:]])
     else:
@@ -149,7 +155,7 @@ def guarded(fn):
             except gr.Error:
                 raise
             except Exception as e:  # noqa: BLE001
-                raise gr.Error(message(e)) from e
+                raise gr.Error(message(e)) from e  # a real failure
     return run
 
 
@@ -271,7 +277,7 @@ def build():
         def fields_of(*vals):
             f = dict(zip(FIELDS, vals))
             if not f["name"].strip():
-                raise gr.Error("Give the character a name first.")
+                raise nope("Give the character a name first.")
             return f
 
         def voice_state(name):
@@ -290,7 +296,7 @@ def build():
         @guarded
         def on_load(char_slug):
             if not char_slug:
-                raise gr.Error("Pick a saved character.")
+                raise nope("Pick a saved character.")
             f, start_img = P.load_character(char_slug)
             session(character=char_slug)
             return (*[f.get(k, "") for k in FIELDS], start_img, P.video_prompt(f), *voice_state(f["name"]))
@@ -308,9 +314,10 @@ def build():
             return gr.update(choices=found, value=found[0] if found else None)
 
         @guarded
-        def on_write(idea, secs, *vals):
+        def on_write(idea, secs, theme_, *vals):
+            idea = idea or theme_.strip()  # no idea picked: write straight from the theme
             if not idea:
-                raise gr.Error("Pick an idea first (or paste your own script).")
+                raise nope("Click **Suggest ideas** and pick one, type a theme, or paste your own script.")
             return P.write_script(fields_of(*vals), idea, int(secs))
 
         def script_info(vd):
@@ -326,9 +333,9 @@ def build():
             try:
                 s = [int(x) for x in text.replace(",", " ").split()]
             except ValueError:
-                raise gr.Error("Seeds must be whole numbers, e.g. 42, 7, 1234.") from None
+                raise nope("Seeds must be whole numbers, e.g. 42, 7, 1234.") from None
             if not 1 <= len(s) <= MAX_TAKES:
-                raise gr.Error(f"Use 1 to {MAX_TAKES} seeds.")
+                raise nope(f"Use 1 to {MAX_TAKES} seeds.")
             return s
 
         def take_updates(paths):
@@ -355,7 +362,7 @@ def build():
         def on_use(script_, hook_, prompt_, negative_, seeds_, steps_, *vals):
             f = fields_of(*vals)
             if not script_.strip():
-                raise gr.Error("The script is empty.")
+                raise nope("The script is empty.")
             d = P.new_video(f["name"], script_, hook_)
             session(character=P.slug(f["name"]), video_dir=d)
             have = P.existing_takes(f["name"], prompt_ or P.video_prompt(f), negative_, steps_, parse_seeds(seeds_))
@@ -379,13 +386,13 @@ def build():
         @guarded
         def on_lock(name, take, desc, lang):
             if not take:
-                raise gr.Error("Design the voice and pick a take first.")
+                raise nope("Design the voice and pick a take first.")
             return P.lock_voice(name, take, desc, lang)
 
         @guarded
         def on_speak(name, vd):
             if not vd:
-                raise gr.Error("Save a script first (Script tab → Use this script).")
+                raise nope("Save a script first (Script tab → Use this script).")
             for log, path in P.speak(name, vd):
                 yield log, path
 
@@ -393,7 +400,7 @@ def build():
         @guarded
         def on_takes(name, vd, prompt_, negative_, seeds_, steps_):
             if not vd:
-                raise gr.Error("Save a script first (Script tab → Use this script).")
+                raise nope("Save a script first (Script tab → Use this script).")
             for log, paths in P.make_takes(name, vd, prompt_, negative_, parse_seeds(seeds_), int(steps_)):
                 vids, choices = take_updates(paths)
                 yield log, *vids, choices
@@ -402,19 +409,19 @@ def build():
         @guarded
         def on_lipsync(vd, takes, keep_, fp16_):
             if not vd:
-                raise gr.Error("Save a script first.")
+                raise nope("Save a script first.")
             takes = takes or saved_takes(vd)
             if not takes:
-                raise gr.Error("No video takes yet: make them on the Video tab.")
+                raise nope("No video takes yet: make them on the Video tab.")
             if not (Path(vd) / "voice.wav").exists():
-                raise gr.Error("No voice-over yet: Voice tab → Speak the script.")
+                raise nope("No voice-over yet: Voice tab → Speak the script.")
             for log, path in P.lipsync(vd, takes, float(keep_ or 0), fp16_):
                 yield log, path
 
         @guarded
         def on_finish(vd, hook_, amb, eng):
             if not vd or not (Path(vd) / "lipsync.mp4").exists():
-                raise gr.Error("Lip-sync first.")
+                raise nope("Lip-sync first.")
             for log, path in P.finish(vd, hook_, float(amb), eng):
                 yield log, path, path
 
@@ -423,9 +430,9 @@ def build():
             """Voice (if not spoken yet) -> takes -> lip-sync -> finish for the saved script in `vd`.
             Yields (log, take paths, final video or None)."""
             if not P.saved_voice(f["name"])[0]:
-                raise gr.Error("Design the voice first (Voice tab → Design voice → Use this voice).")
+                raise nope("Design the voice first (Voice tab → Design voice → Use this voice).")
             if not (P.char_dir(f["name"]) / "start.png").exists():
-                raise gr.Error("Upload a start frame on the Character tab and save first.")
+                raise nope("Upload a start frame on the Character tab and save first.")
             seeds_list = parse_seeds(seeds_)
             takes = lambda: saved_takes(vd)
             spoken = (Path(vd) / "voice.wav").exists() and (Path(vd) / "lines.json").exists()
@@ -449,7 +456,7 @@ def build():
         @guarded
         def on_full(vd, prompt_, negative_, seeds_, steps_, hook_, amb, *vals):
             if not vd:
-                raise gr.Error("Save a script first (Script tab → Use this script).")
+                raise nope("Save a script first (Script tab → Use this script).")
             for log, paths, final_ in full_run(fields_of(*vals), vd, prompt_, negative_, seeds_, steps_, hook_, amb):
                 vids, choices = take_updates(paths)
                 yield log, *vids, choices, final_ or gr.update()
@@ -459,7 +466,7 @@ def build():
         def on_auto(script_, hook_, prompt_, negative_, seeds_, steps_, amb, *vals):
             f = fields_of(*vals)
             if not script_.strip():
-                raise gr.Error("The script is empty.")
+                raise nope("The script is empty.")
             vd = P.new_video(f["name"], script_, hook_)
             session(character=P.slug(f["name"]), video_dir=vd)
             for log, _, final_ in full_run(f, vd, prompt_, negative_, seeds_, steps_, hook_, amb):
@@ -494,7 +501,7 @@ def build():
             def click(*args):
                 running = [j for j in JOBS.values() if j.state == "busy" and (j.slot == slot or (heavy and j.heavy))]
                 if running:
-                    raise gr.Error(f"“{running[0].title}” is still running (it keeps going even if you close the "
+                    raise nope(f"“{running[0].title}” is still running (it keeps going even if you close the "
                                    "page). Wait for it to finish, then try again.")
                 if inspect.isgeneratorfunction(fn):
                     gen = fn(*args)
@@ -511,6 +518,11 @@ def build():
                         break
                     time.sleep(0.1)
                 if job.state == "fail":
+                    if job.quiet:
+                        JOBS.pop(slot, None)  # nothing ran: don't leave a "failed" bar behind
+                        if heavy:
+                            session(pending=None)
+                        raise nope(job.error)
                     raise gr.Error(job.error or "This step failed; see the log.")
                 return job.status()
             return click
@@ -549,7 +561,7 @@ def build():
             button.click(starter(kind), inputs, [SLOTS[KINDS[kind][0]][0]])
 
         go("ideas", ideas_btn, [theme, *boxes.values()])
-        go("write", write_btn, [idea_pick, seconds, *boxes.values()])
+        go("write", write_btn, [idea_pick, seconds, theme, *boxes.values()])
         go("design", design_btn, [boxes["name"], voice_desc, language, n_takes])
         go("speak", speak_btn, [boxes["name"], video_dir])
         go("takes", takes_btn, [boxes["name"], video_dir, prompt, negative, seeds, steps])
